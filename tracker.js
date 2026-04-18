@@ -1,21 +1,23 @@
 /* ==========================================================================
-   TRACKER v7.1 — Simple, direct, fiable
-   Principe :
-   - GPS = source principale du PK (direct, sans EKF)
-   - Pas = backup uniquement quand GPS perdu > 6 secondes
-   - Kalman 1D sur position GPS (lissage position, pas distance)
-   - Seuil anti-bruit minimal pour ne pas bloquer le PK
+   TRACKER v7.2 — Fiable, simple, GPS Doppler + pas backup
+   
+   Correctifs v7.1 :
+   - lastGPSTs mis à jour APRÈS validation du fix (pas avant)
+   - Distance calculée depuis GPS speed (Doppler) quand dispo — plus réactif
+     que la différence de position qui prend 10-20s à se stabiliser
+   - stepDist toujours affiché (pas seulement en mode GPS perdu)
+   - Watchdog GPS perdu fonctionnel
    ========================================================================== */
 (() => {
 'use strict';
 
-const MAX_WALK_SPEED  = 8.33;   // m/s = 30 km/h
+const MAX_WALK_SPEED = 8.33;    // m/s = 30 km/h
 const MAX_TRAIN_SPEED = 33.3;   // m/s = 120 km/h
-const GPS_LOST_MS     = 6000;   // 6s sans GPS → bascule sur pas
+const GPS_LOST_MS    = 6000;    // 6 s sans bon fix → mode pas
 
 const state = {
   active:       false,
-  mode:         'libre',       // 'libre' | 'cumulatif' | 'chantier'
+  mode:         'libre',
   transport:    'walk',
   chantierId:   null,
   refTrace:     null,
@@ -24,11 +26,11 @@ const state = {
   pkFin:        null,
 
   currentPKm:   0,
-  totalDist:    0,             // distance cumulée GPS (mètres)
-  stepDist:     0,             // distance cumulée pas (mètres)
+  totalDist:    0,      // distance GPS cumulée (m)
+  stepDist:     0,      // distance pas cumulée (m)
 
-  lastPos:      null,          // { lat, lon, ts, acc }
-  lastGPSTs:    0,
+  lastPos:      null,
+  lastGPSTs:    0,      // timestamp du DERNIER bon fix GPS
   gpsLost:      false,
 
   lastSpeed:    null,
@@ -45,12 +47,11 @@ const state = {
 
   stride:       0.72,
   stepsAtStart: 0,
-  lastStepCount: 0,
+  lastStepCount:0,
 
   trace:        [],
-  driftEstimate: 0,
-  accAlertShown: false,
-  lastTrustChange: 0
+  driftEstimate:0,
+  accAlertShown:false
 };
 
 let _onUpdate = null;
@@ -60,7 +61,7 @@ function emit(type, data) { if (_onEvent) _onEvent(type, data); }
 function notify()         { if (_onUpdate) _onUpdate(getSnapshot()); }
 
 // =========================================================================
-// FORMAT PK  ex: 42+350
+// FORMAT PK
 // =========================================================================
 function formatPK(pkM) {
   const neg = pkM < 0;
@@ -77,28 +78,31 @@ function formatPK(pkM) {
 
 function getSnapshot() {
   const steps = Math.max(0, PKT_MOTION.getSteps() - state.stepsAtStart);
-  const dist  = state.gpsLost ? state.stepDist : state.totalDist;
+  // Distance affichée : GPS si disponible, sinon pas
+  const dist  = state.gpsLost
+    ? state.stepDist
+    : Math.max(state.totalDist, state.stepDist * 0.1); // affiche au moins 10% stepDist pour feedback
   return {
-    active:      state.active,
-    mode:        state.mode,
-    transport:   state.transport,
-    pk:          formatPK(state.currentPKm),
-    pkM:         state.currentPKm,
-    dist,                                        // distance affichée
-    distGPS:     state.totalDist,                // distance GPS brute
-    distSteps:   state.stepDist,                 // distance pas brute
-    speed:       state.lastSpeed,
-    heading:     state.lastHeading,
-    trust:       state.trust,
-    sens:        state.sens,
-    sensLocked:  state.sensLocked,
-    lat:         state.lastPos?.lat  ?? null,
-    lon:         state.lastPos?.lon  ?? null,
-    acc:         state.lastPos?.acc  ?? null,
-    drift:       Math.round(state.driftEstimate),
+    active:    state.active,
+    mode:      state.mode,
+    transport: state.transport,
+    pk:        formatPK(state.currentPKm),
+    pkM:       state.currentPKm,
+    dist,
+    distGPS:   state.totalDist,
+    distSteps: state.stepDist,
+    speed:     state.lastSpeed,
+    heading:   state.lastHeading,
+    trust:     state.trust,
+    sens:      state.sens,
+    sensLocked:state.sensLocked,
+    lat:       state.lastPos?.lat  ?? null,
+    lon:       state.lastPos?.lon  ?? null,
+    acc:       state.lastPos?.acc  ?? null,
+    drift:     Math.round(state.driftEstimate),
     steps,
-    pkFin:       state.pkFin,
-    gpsLost:     state.gpsLost
+    pkFin:     state.pkFin,
+    gpsLost:   state.gpsLost
   };
 }
 
@@ -106,7 +110,7 @@ function getSnapshot() {
 // TRUST
 // =========================================================================
 function computeTrust(acc) {
-  if (state.gpsLost)                              return 'slow';
+  if (state.gpsLost)                               return 'slow';
   if (state.mode === 'chantier' && state.refTrace) {
     if (acc < 10) return 'go';
     if (acc < 25) return 'slow';
@@ -120,7 +124,6 @@ function computeTrust(acc) {
 function setTrust(level) {
   if (state.trust !== level) {
     state.trust = level;
-    state.lastTrustChange = Date.now();
     emit('trust', level);
   }
 }
@@ -132,7 +135,6 @@ function douglasPeucker(pts, tol) {
   if (pts.length < 3) return pts;
   const latRef = pts[0].lat * Math.PI / 180;
   const sc = 111320;
-
   function dist(p, a, b) {
     const dx = (b.lon - a.lon) * sc * Math.cos(latRef);
     const dy = (b.lat - a.lat) * sc;
@@ -143,7 +145,6 @@ function douglasPeucker(pts, tol) {
     const t = Math.max(0, Math.min(1, (px*dx + py*dy) / len2));
     return Math.sqrt((px - t*dx)**2 + (py - t*dy)**2);
   }
-
   function rdp(s, e, mask) {
     let maxD = 0, idx = s;
     for (let i = s+1; i < e; i++) {
@@ -153,7 +154,6 @@ function douglasPeucker(pts, tol) {
     if (maxD > tol) { rdp(s, idx, mask); rdp(idx, e, mask); }
     else for (let i = s+1; i < e; i++) mask[i] = false;
   }
-
   const mask = new Array(pts.length).fill(true);
   rdp(0, pts.length-1, mask);
   return pts.filter((_, i) => mask[i]);
@@ -161,34 +161,34 @@ function douglasPeucker(pts, tol) {
 
 function prepareRefTrace(raw, pkStart) {
   if (!raw || raw.length < 2) return raw;
-  const simplified = douglasPeucker(raw, 4);
+  const s = douglasPeucker(raw, 4);
   let dist = 0;
-  return simplified.map((p, i) => {
-    if (i > 0) dist += PKT_GEO.haversine(simplified[i-1].lat, simplified[i-1].lon, p.lat, p.lon);
+  return s.map((p, i) => {
+    if (i > 0) dist += PKT_GEO.haversine(s[i-1].lat, s[i-1].lon, p.lat, p.lon);
     return { lat: p.lat, lon: p.lon, pk_m: pkStart + dist };
   });
 }
 
 // =========================================================================
-// HANDLER GPS — source principale du PK
+// HANDLER GPS
 // =========================================================================
 function onGPS(pos) {
   const rawLa = pos.coords.latitude;
   const rawLo = pos.coords.longitude;
   const acc   = pos.coords.accuracy;
-  const spd   = pos.coords.speed;
+  const spd   = pos.coords.speed; // m/s — calculé par Doppler GPS, très fiable
 
-  state.lastGPSTs = Date.now();
-
-  // Rejeter fixes très dégradés
+  // ⚠️ Ne mettre à jour lastGPSTs QU'APRÈS validation du fix
+  // (si on le met avant, même un fix pourri empêche le watchdog de se déclencher)
   if (acc > 80) {
     setTrust('stop');
     emit('gps-weak', { acc });
     notify();
-    return;
+    return; // FIX REJETÉ — lastGPSTs non mis à jour → watchdog peut se déclencher
   }
 
-  // Reprendre après GPS perdu
+  // Fix valide → reset timer GPS
+  state.lastGPSTs = Date.now();
   if (state.gpsLost) {
     state.gpsLost = false;
     emit('gps-recovered');
@@ -206,71 +206,79 @@ function onGPS(pos) {
   // Premier fix
   if (!state.lastPos) {
     state.lastPos = { lat: la, lon: lo, ts: Date.now(), acc };
+    state.lastSpeed = spd != null ? Math.round(spd * 3.6) : null;
     setTrust(computeTrust(acc));
     notify();
     return;
   }
 
+  const dt = (Date.now() - state.lastPos.ts) / 1000; // secondes
   const d  = PKT_GEO.haversine(state.lastPos.lat, state.lastPos.lon, la, lo);
-  const dt = (Date.now() - state.lastPos.ts) / 1000;
 
-  // Seuil anti-bruit minimal — ne bloquer QUE le bruit GPS pur (<30cm)
-  if (d < 0.3) {
-    state.lastPos = { lat: la, lon: lo, ts: Date.now(), acc };
-    notify();
-    return;
-  }
-
-  // Plausibilité vitesse
+  // Plausibilité vitesse (rejeter sauts GPS absurdes)
   const maxSpd = state.transport === 'train' ? MAX_TRAIN_SPEED : MAX_WALK_SPEED;
   if (dt > 0 && d / dt > maxSpd) {
     emit('gps-jump', { d, dt });
+    state.lastPos = { lat: la, lon: lo, ts: Date.now(), acc };
     return;
   }
 
-  // Heading GPS (fiable sur voie — magnétomètre perturbé par rails)
-  if (spd != null && spd > 0.5) {
-    state.lastHeading = PKT_GEO.bearing(state.lastPos.lat, state.lastPos.lon, la, lo);
+  // ---- CALCUL DISTANCE ----
+  // Priorité 1 : GPS speed (Doppler) — disponible dès le 1er fix sur iPhone
+  //   Plus fiable que la différence de position les 15-20 premières secondes
+  // Priorité 2 : différence de position (fallback si speed non dispo)
+  let dUsed = 0;
+  if (spd != null && spd >= 0 && dt > 0 && dt < 10) {
+    dUsed = spd * dt; // distance = vitesse × temps
+  } else if (d > 0 && dt > 0) {
+    dUsed = d;
   }
 
-  // Détection sens de marche
-  if (!state.sensLocked && state.mode !== 'chantier') {
-    const brg = PKT_GEO.bearing(state.lastPos.lat, state.lastPos.lon, la, lo);
-    state.sensBuf.push({ brg, d });
-    const total = state.sensBuf.reduce((s, b) => s + b.d, 0);
-    if (total > 30) {
-      let sx = 0, cx = 0;
-      state.sensBuf.forEach(b => {
-        const r = b.brg * Math.PI / 180;
-        sx += Math.sin(r) * b.d;
-        cx += Math.cos(r) * b.d;
-      });
-      const avg = ((Math.atan2(sx, cx) * 180 / Math.PI) + 360) % 360;
-      emit('sens-detected', {
-        bearing: avg,
-        sens:  (avg < 90 || avg > 270) ? 1 : -1,
-        label: PKT_GEO.bearingLabel(avg)
-      });
+  // Rejeter si distance absurde (> 200m en une itération pour un piéton)
+  if (dUsed > 200) dUsed = 0;
+
+  if (dUsed > 0) {
+    state.totalDist += dUsed;
+    state.driftEstimate = acc;
+
+    // Heading depuis GPS (plus fiable que magnétomètre près des rails)
+    if (spd != null && spd > 0.5) {
+      state.lastHeading = PKT_GEO.bearing(state.lastPos.lat, state.lastPos.lon, la, lo);
     }
-  }
 
-  // ---- CALCUL DISTANCE GPS ----
-  state.totalDist += d;
-  state.driftEstimate = acc;
+    // Détection sens
+    if (!state.sensLocked && state.mode !== 'chantier' && d > 0.5) {
+      const brg = PKT_GEO.bearing(state.lastPos.lat, state.lastPos.lon, la, lo);
+      state.sensBuf.push({ brg, d });
+      const total = state.sensBuf.reduce((s, b) => s + b.d, 0);
+      if (total > 30) {
+        let sx = 0, cx = 0;
+        state.sensBuf.forEach(b => {
+          const r = b.brg * Math.PI / 180;
+          sx += Math.sin(r) * b.d;
+          cx += Math.cos(r) * b.d;
+        });
+        const avg = ((Math.atan2(sx, cx) * 180 / Math.PI) + 360) % 360;
+        emit('sens-detected', {
+          bearing: avg,
+          sens:    (avg < 90 || avg > 270) ? 1 : -1,
+          label:   PKT_GEO.bearingLabel(avg)
+        });
+      }
+    }
 
-  // ---- CALCUL PK ----
-  if (state.mode === 'chantier' && state.refTrace) {
-    const proj = PKT_GEO.projectOnPolyline({ lat: la, lon: lo }, state.refTrace);
-    if (proj && proj.distance < Math.max(30, acc * 2)) {
-      state.currentPKm   = proj.pk_m + state.pkOffset;
-      state.driftEstimate = Math.max(3, proj.distance);
+    // ---- CALCUL PK ----
+    if (state.mode === 'chantier' && state.refTrace) {
+      const proj = PKT_GEO.projectOnPolyline({ lat: la, lon: lo }, state.refTrace);
+      if (proj && proj.distance < Math.max(30, acc * 2)) {
+        state.currentPKm    = proj.pk_m + state.pkOffset;
+        state.driftEstimate = Math.max(3, proj.distance);
+      } else {
+        state.currentPKm = state.pkStart + state.totalDist * state.sens + state.pkOffset;
+      }
     } else {
-      // Hors trace → cumulatif
       state.currentPKm = state.pkStart + state.totalDist * state.sens + state.pkOffset;
     }
-  } else {
-    // Mode libre ou cumulatif
-    state.currentPKm = state.pkStart + state.totalDist * state.sens + state.pkOffset;
   }
 
   setTrust(computeTrust(acc));
@@ -293,8 +301,7 @@ function onGPSError(err) {
 }
 
 // =========================================================================
-// HANDLER PAS — backup quand GPS perdu uniquement
-// Appelé depuis ui.js via PKT_MOTION.onStep(cb)
+// HANDLER PAS — toujours actif, PK uniquement si GPS perdu
 // =========================================================================
 function onStepPDR(stepCount, ts) {
   if (!state.active) return;
@@ -303,24 +310,25 @@ function onStepPDR(stepCount, ts) {
   const stepsDelta = steps - state.lastStepCount;
   if (stepsDelta <= 0) return;
 
-  state.stepDist = steps * state.stride;
+  // stepDist toujours mis à jour (affiché même quand GPS actif)
+  state.stepDist      = steps * state.stride;
   state.lastStepCount = steps;
 
-  // N'utiliser les pas pour le PK QUE si GPS perdu
-  if (!state.gpsLost) return;
+  // Avancer le PK par les pas UNIQUEMENT si GPS perdu
+  if (!state.gpsLost) {
+    notify(); // quand même rafraîchir l'UI pour le compteur de pas
+    return;
+  }
 
-  // PDR pur : le PK avance par les pas
   const distDelta     = stepsDelta * state.stride;
   state.totalDist    += distDelta;
   state.driftEstimate += distDelta * 0.15;
 
   if (state.mode === 'chantier' && state.refTrace && state.lastPos) {
     const proj = PKT_GEO.projectOnPolyline(state.lastPos, state.refTrace);
-    if (proj) {
-      state.currentPKm = proj.pk_m + (state.totalDist - state.gpsDist || 0) * state.sens + state.pkOffset;
-    } else {
-      state.currentPKm = state.pkStart + state.totalDist * state.sens + state.pkOffset;
-    }
+    state.currentPKm = proj
+      ? proj.pk_m + state.pkOffset
+      : state.pkStart + state.totalDist * state.sens + state.pkOffset;
   } else {
     state.currentPKm = state.pkStart + state.totalDist * state.sens + state.pkOffset;
   }
@@ -335,33 +343,32 @@ async function start(opts) {
   opts = opts || {};
   if (state.active) return;
 
-  state.mode        = opts.mode || 'libre';
-  state.transport   = opts.transport || 'walk';
-  state.chantierId  = opts.chantierId || null;
-  state.pkStart     = opts.pkStart || 0;
-  state.pkFin       = opts.pkFin   || null;
-  state.pkOffset    = 0;
-  state.currentPKm  = state.pkStart;
-  state.totalDist   = 0;
-  state.stepDist    = 0;
-  state.driftEstimate = 0;
-  state.lastPos     = null;
-  state.lastGPSTs   = Date.now();
-  state.gpsLost     = false;
-  state.lastSpeed   = null;
-  state.lastHeading = null;
-  state.sens        = opts.sens || 1;
-  state.sensLocked  = opts.sensLocked || false;
-  state.sensBuf     = [];
-  state.kalman      = PKT_GEO.Kalman(0.6);
-  state.trace       = [];
+  state.mode         = opts.mode || 'libre';
+  state.transport    = opts.transport || 'walk';
+  state.chantierId   = opts.chantierId || null;
+  state.pkStart      = opts.pkStart || 0;
+  state.pkFin        = opts.pkFin   || null;
+  state.pkOffset     = 0;
+  state.currentPKm   = state.pkStart;
+  state.totalDist    = 0;
+  state.stepDist     = 0;
+  state.driftEstimate= 0;
+  state.lastPos      = null;
+  state.lastGPSTs    = Date.now();
+  state.gpsLost      = false;
+  state.lastSpeed    = null;
+  state.lastHeading  = null;
+  state.sens         = opts.sens || 1;
+  state.sensLocked   = opts.sensLocked || false;
+  state.sensBuf      = [];
+  state.kalman       = PKT_GEO.Kalman(0.6);
+  state.trace        = [];
   state.stepsAtStart = PKT_MOTION.getSteps();
-  state.lastStepCount = 0;
-  state.stride      = opts.stride || 0.72;
-  state.accAlertShown = false;
-  state.active      = true;
+  state.lastStepCount= 0;
+  state.stride       = opts.stride || 0.72;
+  state.accAlertShown= false;
+  state.active       = true;
 
-  // Préparer polyligne débruitée
   if (opts.mode === 'chantier' && opts.refTrace && opts.refTrace.length > 10) {
     state.refTrace = prepareRefTrace(opts.refTrace, opts.pkStart || 0);
   } else {
@@ -370,13 +377,11 @@ async function start(opts) {
 
   setTrust('slow');
 
-  // Capteurs
   try { await PKT_MOTION.requestPermission(); } catch {}
   PKT_MOTION.start();
-  // Enregistrer le handler PDR (backup GPS perdu)
   PKT_MOTION.onStep(onStepPDR);
 
-  // Wake lock + ré-acquisition au retour au premier plan
+  // Wake lock
   try {
     if ('wakeLock' in navigator) {
       state.wakeLock = await navigator.wakeLock.request('screen');
@@ -388,22 +393,22 @@ async function start(opts) {
     }
   } catch {}
 
-  // GPS
   if (!navigator.geolocation) {
     emit('gps-unavailable');
     state.active = false;
     return;
   }
+
   state.watchId = navigator.geolocation.watchPosition(onGPS, onGPSError, {
     enableHighAccuracy: true,
-    maximumAge: 1000,   // accepte un fix de moins d'1s — évite les délais
-    timeout: 15000
+    maximumAge: 1000,
+    timeout:    15000
   });
 
-  // Watchdog GPS lost
+  // Watchdog GPS lost — vérifie toutes les 2s
   state._watchdog = setInterval(() => {
     if (!state.active) return;
-    if (Date.now() - state.lastGPSTs > GPS_LOST_MS && !state.gpsLost) {
+    if (!state.gpsLost && Date.now() - state.lastGPSTs > GPS_LOST_MS) {
       state.gpsLost = true;
       emit('gps-lost');
       setTrust('slow');
@@ -440,13 +445,13 @@ function stop() {
 }
 
 // =========================================================================
-// RECALIBRATION
+// RECALIBRATION + UTILITAIRES
 // =========================================================================
 function recalibrate(pkKm) {
-  const pkM  = pkKm * 1000;
-  const old  = formatPK(state.currentPKm).full;
-  state.pkOffset   += pkM - state.currentPKm;
-  state.currentPKm  = pkM;
+  const pkM = pkKm * 1000;
+  const old = formatPK(state.currentPKm).full;
+  state.pkOffset  += pkM - state.currentPKm;
+  state.currentPKm = pkM;
   state.driftEstimate = 0;
   state.gpsLost    = false;
   state.lastGPSTs  = Date.now();
