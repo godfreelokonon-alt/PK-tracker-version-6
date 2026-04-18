@@ -875,12 +875,12 @@ function buildPDFHtml(chantier, sigs, photos, meta) {
   const agentTitle = escPDF(meta.agentTitle || '—');
   const rapportRef = escPDF(meta.rapportRef || '—');
 
-  // ---- LOGO RATP (SVG inline) ----
-  const logoRATP = `<svg width="52" height="52" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect width="52" height="52" rx="8" fill="#D4021D"/>
-    <text x="26" y="34" font-family="Arial Black,Arial,sans-serif" font-size="18" font-weight="900"
-      fill="white" text-anchor="middle" letter-spacing="-1">RATP</text>
-  </svg>`;
+  // ---- EN-TÊTE NEUTRE (pas de logo RATP officiel sans accord comm) ----
+  const logoRATP = `<div style="display:flex;flex-direction:column;justify-content:center;">
+    <div style="font-size:13pt;font-weight:900;color:#D4021D;letter-spacing:0.05em;line-height:1;">INFRASTRUCTURE</div>
+    <div style="font-size:13pt;font-weight:900;color:#D4021D;letter-spacing:0.05em;line-height:1;">FERROVIAIRE</div>
+    <div style="font-size:8pt;color:#9CA3AF;margin-top:2px;letter-spacing:0.08em;">INSPECTION QUALITÉ VOIE</div>
+  </div>`;
 
   // ---- LOGO PK TRACKER (SVG inline) ----
   const logoPKT = `<svg width="52" height="52" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
