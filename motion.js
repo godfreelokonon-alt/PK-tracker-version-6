@@ -15,11 +15,11 @@
 
 // ---- Constantes calibrées (Brajdic & Harle 2013 + Weinberg AN-602) ----
 const HP_ALPHA        = 0.974;   // fc ≈ 0.25 Hz à ~60 Hz — isole la gravité sans toucher la marche
-const WINDOW_SAMPLES  = 36;      // fenêtre ~0.6 s à 60 Hz pour détection pic
+const WINDOW_SAMPLES  = 24;      // fenêtre ~0.6 s à 60 Hz pour détection pic
 const SMOOTH_SAMPLES  = 18;      // lissage ~0.3 s
-const PROMINENCE_MIN  = 1.2;     // m/s² — prominence minimale pour valider un pic
+const PROMINENCE_MIN  = 0.8;     // m/s² — prominence minimale pour valider un pic
 const REFRACTORY_MS   = 300;     // ms — délai min entre deux pas
-const CONFIRM_STEPS   = 3;       // nb de pas consécutifs avant de commencer à compter
+const CONFIRM_STEPS   = 2;       // nb de pas consécutifs avant de commencer à compter
 const MAX_STEP_MS     = 2000;    // si aucun pas depuis 2 s → réinitialiser la séquence
 
 // ---- État interne ----
