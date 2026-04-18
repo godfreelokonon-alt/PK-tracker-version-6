@@ -54,11 +54,12 @@ const state = {
   accAlertShown:false
 };
 
-let _onUpdate = null;
-let _onEvent  = null;
+// Multi-listener : plusieurs callbacks peuvent s'abonner sans s'écraser
+const _updateCbs = [];
+const _eventCbs  = [];
 
-function emit(type, data) { if (_onEvent) _onEvent(type, data); }
-function notify()         { if (_onUpdate) _onUpdate(getSnapshot()); }
+function emit(type, data) { _eventCbs.forEach(cb => { try { cb(type, data); } catch(e) {} }); }
+function notify()         { const s = getSnapshot(); _updateCbs.forEach(cb => { try { cb(s); } catch(e) {} }); }
 
 // =========================================================================
 // FORMAT PK
@@ -78,10 +79,8 @@ function formatPK(pkM) {
 
 function getSnapshot() {
   const steps = Math.max(0, PKT_MOTION.getSteps() - state.stepsAtStart);
-  // Distance affichée : GPS si disponible, sinon pas
-  const dist  = state.gpsLost
-    ? state.stepDist
-    : Math.max(state.totalDist, state.stepDist * 0.1); // affiche au moins 10% stepDist pour feedback
+  // Distance affichée : GPS si disponible, pas si GPS perdu
+  const dist = state.gpsLost ? state.stepDist : state.totalDist;
   return {
     active:    state.active,
     mode:      state.mode,
@@ -187,12 +186,8 @@ function onGPS(pos) {
     return; // FIX REJETÉ — lastGPSTs non mis à jour → watchdog peut se déclencher
   }
 
-  // Fix valide → reset timer GPS
+  // Fix valide → reset timer GPS (APRÈS validation, pas avant)
   state.lastGPSTs = Date.now();
-  if (state.gpsLost) {
-    state.gpsLost = false;
-    emit('gps-recovered');
-  }
 
   // Filtre Kalman position
   const filtered = state.kalman.update(rawLa, rawLo, acc);
@@ -207,34 +202,42 @@ function onGPS(pos) {
   if (!state.lastPos) {
     state.lastPos = { lat: la, lon: lo, ts: Date.now(), acc };
     state.lastSpeed = spd != null ? Math.round(spd * 3.6) : null;
+    // Sortir du mode GPS perdu seulement maintenant (premier bon fix)
+    if (state.gpsLost) { state.gpsLost = false; emit('gps-recovered'); }
     setTrust(computeTrust(acc));
     notify();
     return;
   }
 
-  const dt = (Date.now() - state.lastPos.ts) / 1000; // secondes
+  const dt = (Date.now() - state.lastPos.ts) / 1000;
   const d  = PKT_GEO.haversine(state.lastPos.lat, state.lastPos.lon, la, lo);
 
-  // Plausibilité vitesse (rejeter sauts GPS absurdes)
+  // Plausibilité vitesse — rejeter sauts GPS absurdes
+  // Important : ne pas reset gpsLost sur un saut invalide
   const maxSpd = state.transport === 'train' ? MAX_TRAIN_SPEED : MAX_WALK_SPEED;
   if (dt > 0 && d / dt > maxSpd) {
     emit('gps-jump', { d, dt });
     state.lastPos = { lat: la, lon: lo, ts: Date.now(), acc };
-    return;
+    return; // gpsLost NON réinitialisé sur saut invalide
+  }
+
+  // Fix valide et cohérent → sortir du mode GPS perdu
+  if (state.gpsLost) {
+    state.gpsLost = false;
+    emit('gps-recovered');
   }
 
   // ---- CALCUL DISTANCE ----
-  // Priorité 1 : GPS speed (Doppler) — disponible dès le 1er fix sur iPhone
-  //   Plus fiable que la différence de position les 15-20 premières secondes
-  // Priorité 2 : différence de position (fallback si speed non dispo)
+  // Priorité 1 : GPS speed Doppler (> 0.3 m/s pour éviter dérive à l'arrêt)
+  // Priorité 2 : différence de position (fallback)
   let dUsed = 0;
-  if (spd != null && spd >= 0 && dt > 0 && dt < 10) {
-    dUsed = spd * dt; // distance = vitesse × temps
-  } else if (d > 0 && dt > 0) {
+  if (spd != null && spd > 0.3 && dt > 0 && dt < 10) {
+    dUsed = spd * dt;
+  } else if (d > 0.3 && dt > 0) {
     dUsed = d;
   }
 
-  // Rejeter si distance absurde (> 200m en une itération pour un piéton)
+  // Rejeter distance absurde (> 200m en une itération)
   if (dUsed > 200) dUsed = 0;
 
   if (dUsed > 0) {
@@ -475,8 +478,9 @@ function setStride(s) {
 
 function getState()   { return state; }
 function getTrace()   { return state.trace.slice(); }
-function onUpdate(cb) { _onUpdate = cb; }
-function onEvent(cb)  { _onEvent  = cb; }
+// addListener pattern — ne s'écrase plus entre tracker.js, ui.js et index.html
+function onUpdate(cb) { if (typeof cb === 'function' && !_updateCbs.includes(cb)) _updateCbs.push(cb); }
+function onEvent(cb)  { if (typeof cb === 'function' && !_eventCbs.includes(cb))  _eventCbs.push(cb); }
 
 window.PKT_TRACKER = {
   start, stop, recalibrate, lockSens, setStride,
