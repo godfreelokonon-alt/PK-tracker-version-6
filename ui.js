@@ -278,17 +278,15 @@ async function stopSession() {
   $('mark-zone').classList.remove('visible');
 }
 
-// buildRefTrace v7 : délégué à tracker.js (prepareRefTrace interne)
-// La trace brute GPS est maintenant débruitée par Douglas-Peucker (4 m)
-// avant d'être stockée comme référence — plus besoin de reconstruire ici.
 function buildRefTrace(trace, pkStart) {
-  // On stocke la trace brute Kalman-filtrée ;
-  // tracker.js appliquera Douglas-Peucker au chargement en mode chantier.
-  let dist = 0;
   const out = [];
+  let dist = 0;
   for (let i = 0; i < trace.length; i++) {
-    if (i > 0) dist += PKT_GEO.haversine(trace[i-1].lat, trace[i-1].lon, trace[i].lat, trace[i].lon);
-    out.push({ lat: trace[i].lat, lon: trace[i].lon, pk_m: pkStart + dist });
+    const p = trace[i];
+    if (i > 0) {
+      dist += PKT_GEO.haversine(trace[i-1].lat, trace[i-1].lon, p.lat, p.lon);
+    }
+    out.push({ lat: p.lat, lon: p.lon, pk_m: pkStart + dist });
   }
   return out;
 }
@@ -328,15 +326,6 @@ function refreshTrackingUI(s) {
   $('telem-speed').textContent = s.speed != null ? s.speed : '—';
   $('telem-steps').textContent = s.steps || 0;
 
-  // Indicateur GPS perdu (mode tunnel / zone couverte)
-  const gpsLostEl = $('gps-lost-banner');
-  if (gpsLostEl) {
-    gpsLostEl.style.display = s.gpsLost ? 'flex' : 'none';
-    if (s.gpsLost) {
-      gpsLostEl.textContent = '📡 GPS perdu — PK estimé par pas (' + (s.steps||0) + ' pas · ±' + s.drift + ' m)';
-    }
-  }
-
   // Progress bar
   if (s.pkFin && app.sessionOpts) {
     const range = Math.abs(s.pkFin - (app.sessionOpts.pkStart || 0));
@@ -371,9 +360,6 @@ PKT_TRACKER.onEvent(async (type, data) => {
   }
   if (type === 'gps-degraded') {
     toast('GPS dégradé ±' + Math.round(data.acc) + ' m — confiance diminuée', 'warn');
-  }
-  if (type === 'gps-lost') {
-    toast('📡 GPS perdu — PK continue par podomètre', 'warn', 4000);
   }
   if (type === 'gps-error') {
     toast('Erreur GPS : ' + data.message, 'error');
@@ -826,138 +812,651 @@ window.exportPDF = async function() {
   const chId = app.sessionOpts?.chantierId;
   const chantier = chId ? await PKT_DB.get(PKT_DB.STORES.chantiers, chId) : null;
   const targetSigs = chantier ? sigs.filter(s => s.chantier_id === chId) : sigs;
-  await openPDFPreview(chantier, targetSigs);
+
+  // Demander les infos agent avant génération
+  const html = `
+    <div class="sheet-field-group">
+      <label class="sheet-label">Nom de l'agent</label>
+      <input id="pdf-agent-name" class="field" type="text" placeholder="Prénom NOM" />
+    </div>
+    <div class="sheet-field-group">
+      <label class="sheet-label">Fonction / Titre</label>
+      <input id="pdf-agent-title" class="field" type="text" placeholder="ex : Responsable Études Travaux" />
+    </div>
+    <div class="sheet-field-group">
+      <label class="sheet-label">Référence rapport (optionnel)</label>
+      <input id="pdf-ref" class="field" type="text" placeholder="ex : RT-2026-042" />
+    </div>`;
+
+  const result = await sheet({
+    title: 'Générer le rapport PDF',
+    html,
+    actions: [
+      { label: 'Annuler', value: null },
+      { label: 'Générer', value: 'ok', primary: true }
+    ]
+  });
+  if (result !== 'ok') return;
+
+  const agentName  = $('pdf-agent-name')?.value.trim()  || '—';
+  const agentTitle = $('pdf-agent-title')?.value.trim() || '—';
+  const rapportRef = $('pdf-ref')?.value.trim()         || ('RT-' + new Date().toISOString().slice(0,10));
+
+  await openPDFPreview(chantier, targetSigs, { agentName, agentTitle, rapportRef });
 };
 
-async function openPDFPreview(chantier, sigs) {
+async function openPDFPreview(chantier, sigs, meta) {
   const photos = {};
   for (const s of sigs) {
     if (s.photo_id) photos[s.id] = await PKT_DB.get(PKT_DB.STORES.photos, s.photo_id);
   }
-  const html = buildPDFHtml(chantier, sigs, photos);
+  const htmlContent = buildPDFHtml(chantier, sigs, photos, meta || {});
   const w = window.open('', '_blank');
   if (!w) { toast('Débloquez les popups pour imprimer', 'error'); return; }
   w.document.open();
-  w.document.write(html);
+  w.document.write(htmlContent);
   w.document.close();
-  setTimeout(() => { try { w.focus(); w.print(); } catch {} }, 600);
+  setTimeout(() => { try { w.focus(); w.print(); } catch {} }, 800);
 }
 
-function buildPDFHtml(chantier, sigs, photos) {
-  const now = new Date();
-  const dateStr = now.toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' });
-  const timeStr = now.toLocaleTimeString('fr-FR');
-  const alerts = sigs.filter(s => s.type === 'alert');
-  const phs = sigs.filter(s => s.photo_id);
-  const title = chantier ? chantier.name : 'Rapport de tournée';
-  const line = chantier && chantier.line ? 'Ligne ' + chantier.line : '';
-  const range = chantier ? 'PK ' + (chantier.pk_start/1000).toFixed(3) + (chantier.pk_end ? ' → ' + (chantier.pk_end/1000).toFixed(3) : '') : '';
+function buildPDFHtml(chantier, sigs, photos, meta) {
+  const now        = new Date();
+  const dateStr    = now.toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' });
+  const timeStr    = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  const alerts     = sigs.filter(s => s.type === 'alert');
+  const normaux    = sigs.filter(s => s.type !== 'alert');
+  const phs        = sigs.filter(s => s.photo_id);
+  const title      = chantier ? chantier.name : 'Rapport de tournée';
+  const lineLabel  = chantier?.line ? 'Ligne ' + escPDF(chantier.line) : '';
+  const pkStart    = chantier ? (chantier.pk_start/1000).toFixed(3) : '—';
+  const pkEnd      = chantier?.pk_end ? (chantier.pk_end/1000).toFixed(3) : null;
+  const pkRange    = pkEnd ? `PK ${pkStart} → ${pkEnd}` : `À partir de PK ${pkStart}`;
+  const agentName  = escPDF(meta.agentName  || '—');
+  const agentTitle = escPDF(meta.agentTitle || '—');
+  const rapportRef = escPDF(meta.rapportRef || '—');
 
-  const signalementsHtml = sigs.map((s, i) => {
-    const photo = photos[s.id];
+  // ---- LOGO RATP (SVG inline) ----
+  const logoRATP = `<svg width="52" height="52" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="52" height="52" rx="8" fill="#D4021D"/>
+    <text x="26" y="34" font-family="Arial Black,Arial,sans-serif" font-size="18" font-weight="900"
+      fill="white" text-anchor="middle" letter-spacing="-1">RATP</text>
+  </svg>`;
+
+  // ---- LOGO PK TRACKER (SVG inline) ----
+  const logoPKT = `<svg width="52" height="52" viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="52" height="52" rx="8" fill="#0A0E1A"/>
+    <circle cx="26" cy="20" r="9" stroke="#10D981" stroke-width="2.5" fill="none"/>
+    <circle cx="26" cy="20" r="3.5" fill="#10D981"/>
+    <rect x="14" y="32" width="4" height="10" rx="1" fill="#1E2A3A"/>
+    <rect x="20" y="32" width="4" height="10" rx="1" fill="#1E2A3A"/>
+    <rect x="26" y="32" width="4" height="10" rx="1" fill="#1E2A3A"/>
+    <rect x="32" y="32" width="4" height="10" rx="1" fill="#1E2A3A"/>
+    <line x1="14" y1="32" x2="36" y2="32" stroke="#10D981" stroke-width="1.5"/>
+    <line x1="14" y1="42" x2="36" y2="42" stroke="#10D981" stroke-width="1.5"/>
+  </svg>`;
+
+  // ---- TABLEAU RÉCAPITULATIF ANOMALIES ----
+  const tableauAnomalies = alerts.length > 0 ? `
+  <div class="section-block">
+    <div class="section-header alert-header">
+      <span class="section-icon">⚠</span>
+      <span>Récapitulatif des anomalies — ${alerts.length} alerte${alerts.length > 1 ? 's' : ''}</span>
+    </div>
+    <table class="recap-table">
+      <thead>
+        <tr>
+          <th>N°</th>
+          <th>PK</th>
+          <th>Heure</th>
+          <th>Description</th>
+          <th>Photo</th>
+          <th>Précision GPS</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${alerts.map((s, i) => `
+        <tr class="alert-row">
+          <td class="mono">A${String(i+1).padStart(2,'0')}</td>
+          <td class="mono pk-cell">${escPDF(s.pk)}</td>
+          <td class="mono">${escPDF(s.ts_display)}</td>
+          <td>${escPDF(s.note || '—')}</td>
+          <td class="center">${s.photo_id ? '✓' : '—'}</td>
+          <td class="center">${s.acc != null ? '±'+s.acc+' m' : '—'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>` : `
+  <div class="section-block no-alert-box">
+    <span class="no-alert-icon">✓</span>
+    <span>Aucune anomalie détectée sur ce tronçon</span>
+  </div>`;
+
+  // ---- FICHES DÉTAILLÉES ----
+  function buildFiche(s, i, prefix) {
+    const photo   = photos[s.id];
     const isAlert = s.type === 'alert';
+    const typeLabel = isAlert ? 'ALERTE' : s.photo_id ? 'PHOTO' : 'OBSERVATION';
+    const typeClass = isAlert ? 'type-alert' : s.photo_id ? 'type-photo' : 'type-normal';
     return `
-      <div class="entry" ${isAlert ? 'data-alert="1"' : ''}>
-        <div class="entry-head">
-          <div class="entry-num">${String(i+1).padStart(3,'0')}</div>
-          <div class="entry-meta">
-            <div class="entry-pk">PK ${escPDF(s.pk)}</div>
-            <div class="entry-sub">${escPDF(s.date_display)} · ${escPDF(s.ts_display)}${s.cat?' · '+escPDF(s.cat):''}</div>
-          </div>
-          <div class="entry-type ${isAlert ? 'alert' : s.photo_id ? 'photo' : 'normal'}">${isAlert ? 'ALERTE' : s.photo_id ? 'PHOTO' : 'NORMAL'}</div>
+    <div class="fiche ${isAlert ? 'fiche-alert' : ''}">
+      <div class="fiche-header">
+        <div class="fiche-num">${prefix}${String(i+1).padStart(2,'0')}</div>
+        <div class="fiche-pk-block">
+          <div class="fiche-pk">PK ${escPDF(s.pk)}</div>
+          <div class="fiche-date">${escPDF(s.date_display)} · ${escPDF(s.ts_display)}${s.cat ? ' · ' + escPDF(s.cat) : ''}</div>
         </div>
-        ${photo ? `<div class="entry-img"><img src="${photo}" /></div>` : ''}
-        <div class="entry-details">
-          ${s.note ? `<div class="entry-note">${escPDF(s.note)}</div>` : ''}
-          <table class="entry-table">
-            <tr><td>Coordonnées</td><td>${s.lat ? s.lat+'°N  '+s.lon+'°E' : '—'}</td></tr>
-            <tr><td>Précision GPS</td><td>${s.acc != null ? '±'+s.acc+' m' : '—'}</td></tr>
-            ${s.cap != null ? `<tr><td>Cap</td><td>${s.cap}°</td></tr>` : ''}
-            <tr><td>Identifiant</td><td class="mono">${escPDF(s.id)}</td></tr>
-            <tr><td>Empreinte</td><td class="mono">${escPDF(s.hash || '—')}</td></tr>
-          </table>
-        </div>
-      </div>`;
-  }).join('');
+        <div class="fiche-type ${typeClass}">${typeLabel}</div>
+      </div>
+
+      ${s.note ? `<div class="fiche-note">${escPDF(s.note)}</div>` : ''}
+
+      <div class="fiche-body">
+        ${photo ? `<div class="fiche-photo-wrap"><img src="${photo}" class="fiche-photo" alt="Photo PK ${escPDF(s.pk)}" /></div>` : ''}
+        <table class="fiche-table">
+          <tr><td>Point kilométrique</td><td class="mono">${escPDF(s.pk)}</td></tr>
+          <tr><td>Date / Heure</td><td class="mono">${escPDF(s.date_display)} — ${escPDF(s.ts_display)}</td></tr>
+          ${s.lat ? `<tr><td>Coordonnées GPS</td><td class="mono">${s.lat.toFixed(6)}°N  ${s.lon.toFixed(6)}°E</td></tr>` : ''}
+          <tr><td>Précision GPS</td><td class="mono">${s.acc != null ? '±'+s.acc+' m' : '—'}</td></tr>
+          ${s.cap != null ? `<tr><td>Cap / Orientation</td><td class="mono">${s.cap}°</td></tr>` : ''}
+          ${s.cat ? `<tr><td>Catégorie</td><td>${escPDF(s.cat)}</td></tr>` : ''}
+          <tr><td>Statut</td><td><span class="statut-badge">${escPDF(s.statut || 'ouvert')}</span></td></tr>
+          <tr><td>Empreinte SHA-256</td><td class="mono hash">${escPDF(s.hash || '—')}</td></tr>
+        </table>
+      </div>
+    </div>`;
+  }
+
+  const fichesAlertes  = alerts.map((s, i) => buildFiche(s, i, 'A')).join('');
+  const fichesNormaux  = normaux.map((s, i) => buildFiche(s, i, 'P')).join('');
 
   return `<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>${escPDF(title)} — Rapport PK</title>
+<title>${escPDF(title)} — Rapport PK Tracker</title>
 <style>
-  @page { size: A4; margin: 18mm 16mm; }
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; color: #1a1f2e; line-height: 1.4; margin: 0; }
-  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: -0.01em; }
+  @page { size: A4; margin: 15mm 14mm 18mm 14mm; }
+  @page :first { margin-top: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
 
-  .cover { padding: 0 0 20mm; border-bottom: 3px solid #0A0E1A; margin-bottom: 10mm; page-break-after: avoid; }
-  .brand { font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: 0.2em; color: #7C8599; text-transform: uppercase; margin-bottom: 6px; }
-  .title { font-size: 30px; font-weight: 500; letter-spacing: -0.02em; margin-bottom: 4px; }
-  .subtitle { font-size: 13px; color: #4A5268; margin-bottom: 18px; }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 10pt;
+    color: #1a1f2e;
+    line-height: 1.5;
+    background: white;
+  }
 
-  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 14px; }
-  .kpi { border: 1px solid #E5E8EE; border-radius: 8px; padding: 12px 14px; }
-  .kpi-lbl { font-size: 9px; letter-spacing: 0.12em; color: #7C8599; text-transform: uppercase; }
-  .kpi-val { font-size: 22px; font-weight: 500; margin-top: 2px; font-variant-numeric: tabular-nums; }
-  .kpi-val.alert { color: #D62B2B; }
+  .mono { font-family: "Courier New", Courier, monospace; font-size: 9pt; }
+  .center { text-align: center; }
 
-  .section-title { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #7C8599; margin: 14mm 0 4mm; border-top: 1px solid #E5E8EE; padding-top: 4mm; }
+  /* ======= PAGE DE GARDE ======= */
+  .cover-page {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    page-break-after: always;
+    padding: 12mm 14mm;
+  }
 
-  .entry { border: 1px solid #E5E8EE; border-radius: 8px; margin-bottom: 6mm; overflow: hidden; page-break-inside: avoid; }
-  .entry[data-alert="1"] { border-color: #F5A524; }
-  .entry-head { display: flex; align-items: center; padding: 10px 14px; background: #FAFBFC; border-bottom: 1px solid #EEF0F4; gap: 12px; }
-  .entry-num { font-family: ui-monospace, monospace; font-size: 11px; color: #7C8599; min-width: 26px; }
-  .entry-meta { flex: 1; }
-  .entry-pk { font-family: ui-monospace, monospace; font-size: 16px; font-weight: 500; letter-spacing: -0.01em; }
-  .entry-sub { font-size: 11px; color: #7C8599; margin-top: 1px; }
-  .entry-type { font-size: 9px; letter-spacing: 0.08em; padding: 3px 8px; border-radius: 4px; font-weight: 500; }
-  .entry-type.alert { background: #FEF2E0; color: #B36F00; }
-  .entry-type.photo { background: #E5EEFD; color: #0C447C; }
-  .entry-type.normal { background: #E7F7EF; color: #0C6E3E; }
-  .entry-img { text-align: center; background: #f8f9fb; padding: 4px; }
-  .entry-img img { max-width: 100%; max-height: 90mm; object-fit: contain; }
-  .entry-details { padding: 10px 14px; }
-  .entry-note { font-size: 13px; margin-bottom: 8px; color: #1a1f2e; font-weight: 500; }
-  .entry-table { width: 100%; font-size: 10px; border-collapse: collapse; }
-  .entry-table td { padding: 3px 0; vertical-align: top; }
-  .entry-table td:first-child { color: #7C8599; width: 40%; }
-  .entry-table td:last-child { font-family: ui-monospace, monospace; }
+  .cover-logos {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 8mm;
+    border-bottom: 3px solid #D4021D;
+    margin-bottom: 12mm;
+  }
 
-  .footer { font-size: 9px; color: #7C8599; margin-top: 20mm; border-top: 1px solid #EEF0F4; padding-top: 4mm; font-family: ui-monospace, monospace; letter-spacing: 0.04em; }
+  .cover-logos-left { display: flex; align-items: center; gap: 12px; }
+  .cover-logo-label {
+    font-size: 11pt;
+    font-weight: 700;
+    color: #1a1f2e;
+    line-height: 1.2;
+  }
+  .cover-logo-sub { font-size: 8pt; color: #7C8599; font-weight: 400; }
+
+  .cover-ref {
+    font-size: 8pt;
+    color: #7C8599;
+    font-family: "Courier New", monospace;
+    text-align: right;
+  }
+
+  .cover-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 10mm 0;
+  }
+
+  .cover-type {
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: #D4021D;
+    margin-bottom: 6mm;
+  }
+
+  .cover-title {
+    font-size: 26pt;
+    font-weight: 700;
+    color: #0A0E1A;
+    line-height: 1.15;
+    letter-spacing: -0.03em;
+    margin-bottom: 4mm;
+  }
+
+  .cover-subtitle {
+    font-size: 12pt;
+    color: #4A5268;
+    margin-bottom: 10mm;
+  }
+
+  .cover-meta-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4mm 8mm;
+    background: #F8F9FB;
+    border: 1px solid #E5E8EE;
+    border-radius: 6px;
+    padding: 6mm 8mm;
+    margin-bottom: 8mm;
+  }
+
+  .cover-meta-item { display: flex; flex-direction: column; gap: 1mm; }
+  .cover-meta-label {
+    font-size: 7.5pt;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #9CA3AF;
+  }
+  .cover-meta-value { font-size: 10pt; color: #1a1f2e; font-weight: 500; }
+
+  /* KPIs */
+  .cover-kpis {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4mm;
+    margin-bottom: 8mm;
+  }
+  .kpi-card {
+    border: 1px solid #E5E8EE;
+    border-radius: 6px;
+    padding: 5mm 5mm 4mm;
+    text-align: center;
+  }
+  .kpi-card.kpi-alert { border-color: #F5A524; background: #FFFBF2; }
+  .kpi-num {
+    font-size: 22pt;
+    font-weight: 700;
+    color: #0A0E1A;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi-card.kpi-alert .kpi-num { color: #B36F00; }
+  .kpi-lbl { font-size: 7.5pt; color: #9CA3AF; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 1.5mm; }
+
+  /* SECTION SIGNATURE */
+  .cover-signature {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6mm;
+    border-top: 1px solid #E5E8EE;
+    padding-top: 6mm;
+    margin-top: auto;
+  }
+  .sig-block { }
+  .sig-label { font-size: 7.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #9CA3AF; margin-bottom: 2mm; }
+  .sig-name { font-size: 11pt; font-weight: 600; color: #1a1f2e; }
+  .sig-title { font-size: 9pt; color: #4A5268; margin-bottom: 4mm; }
+  .sig-line { border-bottom: 1px solid #1a1f2e; height: 8mm; margin-bottom: 1mm; }
+  .sig-line-label { font-size: 7.5pt; color: #9CA3AF; }
+
+  /* ======= CORPS DU RAPPORT ======= */
+  .report-body { padding: 6mm 0; }
+
+  .section-block {
+    margin-bottom: 8mm;
+    page-break-inside: avoid;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #4A5268;
+    padding: 3mm 4mm;
+    background: #F8F9FB;
+    border-left: 3px solid #CBD5E1;
+    margin-bottom: 3mm;
+  }
+  .section-header.alert-header { border-left-color: #F5A524; color: #92400E; background: #FFFBF2; }
+  .section-icon { font-size: 11pt; }
+
+  /* Tableau récap */
+  .recap-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 9pt;
+  }
+  .recap-table th {
+    background: #F1F5F9;
+    padding: 2.5mm 3mm;
+    text-align: left;
+    font-size: 7.5pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #64748B;
+    border-bottom: 1px solid #E2E8F0;
+  }
+  .recap-table td {
+    padding: 2.5mm 3mm;
+    border-bottom: 1px solid #F1F5F9;
+    vertical-align: middle;
+  }
+  .alert-row { background: #FFFBF2; }
+  .alert-row:hover { background: #FEF3C7; }
+  .pk-cell { font-weight: 600; color: #D4021D; }
+
+  .no-alert-box {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4mm 6mm;
+    background: #F0FDF4;
+    border: 1px solid #86EFAC;
+    border-radius: 6px;
+    color: #166534;
+    font-weight: 500;
+  }
+  .no-alert-icon { font-size: 14pt; color: #16A34A; }
+
+  /* Fiches */
+  .fiche {
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    margin-bottom: 6mm;
+    overflow: hidden;
+    page-break-inside: avoid;
+  }
+  .fiche-alert { border-color: #FCA5A5; }
+
+  .fiche-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 3.5mm 5mm;
+    background: #F8FAFC;
+    border-bottom: 1px solid #E2E8F0;
+  }
+  .fiche-alert .fiche-header { background: #FFF7F7; border-bottom-color: #FCA5A5; }
+
+  .fiche-num {
+    font-family: "Courier New", monospace;
+    font-size: 9pt;
+    color: #94A3B8;
+    min-width: 28px;
+    font-weight: 700;
+  }
+
+  .fiche-pk-block { flex: 1; }
+  .fiche-pk { font-family: "Courier New", monospace; font-size: 13pt; font-weight: 700; color: #0A0E1A; line-height: 1.1; }
+  .fiche-alert .fiche-pk { color: #DC2626; }
+  .fiche-date { font-size: 8pt; color: #94A3B8; margin-top: 0.5mm; }
+
+  .fiche-type {
+    font-size: 7.5pt;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    padding: 2px 7px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+  .type-alert  { background: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; }
+  .type-photo  { background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; }
+  .type-normal { background: #F0FDF4; color: #166534; border: 1px solid #BBF7D0; }
+
+  .fiche-note {
+    padding: 3mm 5mm;
+    font-size: 10pt;
+    font-weight: 600;
+    color: #1a1f2e;
+    border-bottom: 1px solid #F1F5F9;
+    background: white;
+  }
+
+  .fiche-body {
+    display: flex;
+    gap: 0;
+  }
+
+  .fiche-photo-wrap {
+    flex: 0 0 55%;
+    max-width: 55%;
+    background: #F8FAFC;
+    border-right: 1px solid #E2E8F0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3mm;
+  }
+  .fiche-photo {
+    max-width: 100%;
+    max-height: 75mm;
+    object-fit: contain;
+    border-radius: 4px;
+  }
+
+  .fiche-table {
+    flex: 1;
+    border-collapse: collapse;
+    font-size: 8.5pt;
+    padding: 3mm;
+    width: 100%;
+    align-self: flex-start;
+  }
+  .fiche-body:not(:has(.fiche-photo-wrap)) .fiche-table {
+    padding: 3mm 5mm;
+  }
+  .fiche-table td {
+    padding: 2mm 3mm;
+    vertical-align: top;
+    border-bottom: 1px solid #F8FAFC;
+  }
+  .fiche-table tr:last-child td { border-bottom: none; }
+  .fiche-table td:first-child { color: #94A3B8; font-size: 8pt; width: 42%; white-space: nowrap; }
+  .fiche-table td:last-child { color: #1a1f2e; }
+
+  .statut-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 7.5pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    background: #FEF2F2;
+    color: #DC2626;
+    border: 1px solid #FECACA;
+  }
+
+  .hash { font-size: 7pt; color: #94A3B8; letter-spacing: 0.03em; }
+
+  /* Footer */
+  .report-footer {
+    position: fixed;
+    bottom: 0;
+    left: 14mm;
+    right: 14mm;
+    border-top: 1px solid #E2E8F0;
+    padding-top: 2.5mm;
+    padding-bottom: 3mm;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: white;
+    font-size: 7.5pt;
+    color: #94A3B8;
+  }
+  .footer-left { font-family: "Courier New", monospace; }
+  .footer-center { color: #D4021D; font-weight: 600; }
+  .footer-right { font-family: "Courier New", monospace; }
+
+  /* Titres de section dans le corps */
+  .body-section-title {
+    font-size: 9pt;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #4A5268;
+    margin: 8mm 0 4mm;
+    padding-bottom: 2mm;
+    border-bottom: 1.5px solid #E2E8F0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    page-break-after: avoid;
+  }
+  .body-section-title.alert-title { color: #DC2626; border-bottom-color: #FCA5A5; }
+  .body-section-count {
+    background: #F1F5F9;
+    color: #64748B;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 8pt;
+  }
+  .alert-title .body-section-count { background: #FEF2F2; color: #DC2626; }
+
+  @media print {
+    .cover-page { min-height: 100vh; }
+  }
 </style>
 </head>
 <body>
-<div class="cover">
-  <div class="brand">PK Tracker Pro · Rapport de tournée</div>
-  <div class="title">${escPDF(title)}</div>
-  <div class="subtitle">${line ? line + ' · ' : ''}${range ? range + ' · ' : ''}${dateStr} · ${timeStr}</div>
-  <div class="kpis">
-    <div class="kpi"><div class="kpi-lbl">Points</div><div class="kpi-val">${sigs.length}</div></div>
-    <div class="kpi"><div class="kpi-lbl">Photos</div><div class="kpi-val">${phs.length}</div></div>
-    <div class="kpi"><div class="kpi-lbl">Alertes</div><div class="kpi-val alert">${alerts.length}</div></div>
-    <div class="kpi"><div class="kpi-lbl">Date</div><div class="kpi-val" style="font-size:13px;padding-top:6px;">${dateStr.split(' ')[0]} ${dateStr.split(' ')[1]}</div></div>
+
+<!-- ========== PAGE DE GARDE ========== -->
+<div class="cover-page">
+
+  <div class="cover-logos">
+    <div class="cover-logos-left">
+      ${logoRATP}
+      <div>
+        <div class="cover-logo-label">RATP Group</div>
+        <div class="cover-logo-sub">Infrastructure ferroviaire</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      ${logoPKT}
+      <div style="text-align:right;">
+        <div class="cover-logo-label">PK Tracker Pro</div>
+        <div class="cover-logo-sub">Rapport de tournée</div>
+      </div>
+    </div>
   </div>
+
+  <div class="cover-main">
+    <div class="cover-type">Rapport d'inspection · Voie ferrée</div>
+    <div class="cover-title">${escPDF(title)}</div>
+    <div class="cover-subtitle">${lineLabel ? lineLabel + ' · ' : ''}${pkRange}</div>
+
+    <div class="cover-meta-grid">
+      <div class="cover-meta-item">
+        <div class="cover-meta-label">Date d'inspection</div>
+        <div class="cover-meta-value">${dateStr}</div>
+      </div>
+      <div class="cover-meta-item">
+        <div class="cover-meta-label">Heure de génération</div>
+        <div class="cover-meta-value">${timeStr}</div>
+      </div>
+      <div class="cover-meta-item">
+        <div class="cover-meta-label">Référence rapport</div>
+        <div class="cover-meta-value mono">${rapportRef}</div>
+      </div>
+      <div class="cover-meta-item">
+        <div class="cover-meta-label">Tronçon inspecté</div>
+        <div class="cover-meta-value">${pkRange}</div>
+      </div>
+    </div>
+
+    <div class="cover-kpis">
+      <div class="kpi-card">
+        <div class="kpi-num">${sigs.length}</div>
+        <div class="kpi-lbl">Points relevés</div>
+      </div>
+      <div class="kpi-card ${alerts.length > 0 ? 'kpi-alert' : ''}">
+        <div class="kpi-num">${alerts.length}</div>
+        <div class="kpi-lbl">Anomalies</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-num">${phs.length}</div>
+        <div class="kpi-lbl">Photos</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-num">${normaux.length}</div>
+        <div class="kpi-lbl">Observations</div>
+      </div>
+    </div>
+
+    <div class="cover-signature">
+      <div class="sig-block">
+        <div class="sig-label">Rédigé par</div>
+        <div class="sig-name">${agentName}</div>
+        <div class="sig-title">${agentTitle}</div>
+        <div class="sig-line"></div>
+        <div class="sig-line-label">Signature</div>
+      </div>
+      <div class="sig-block">
+        <div class="sig-label">Validé par</div>
+        <div class="sig-name">&nbsp;</div>
+        <div class="sig-title">&nbsp;</div>
+        <div class="sig-line"></div>
+        <div class="sig-line-label">Signature</div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
-${alerts.length ? `<div class="section-title">Alertes · ${alerts.length}</div>` + alerts.map((s,i) => {
-  const photo = photos[s.id];
-  return `<div class="entry" data-alert="1">
-    <div class="entry-head"><div class="entry-num">A${String(i+1).padStart(2,'0')}</div>
-    <div class="entry-meta"><div class="entry-pk">PK ${escPDF(s.pk)}</div><div class="entry-sub">${escPDF(s.date_display)} · ${escPDF(s.ts_display)}</div></div>
-    <div class="entry-type alert">ALERTE</div></div>
-    ${photo ? `<div class="entry-img"><img src="${photo}" /></div>` : ''}
-    <div class="entry-details">${s.note ? `<div class="entry-note">${escPDF(s.note)}</div>` : ''}</div>
-  </div>`;
-}).join('') : ''}
+<!-- ========== CORPS DU RAPPORT ========== -->
+<div class="report-body">
 
-<div class="section-title">Relevés complets · ${sigs.length}</div>
-${signalementsHtml}
+  <!-- Récapitulatif anomalies -->
+  ${tableauAnomalies}
 
-<div class="footer">
-  Document généré par PK Tracker Pro v6.0.0 · ${dateStr} ${timeStr}<br>
-  Chaque entrée comporte une empreinte cryptographique SHA-256 (16 premiers caractères) garantissant l'intégrité des données à la saisie.
+  <!-- Fiches anomalies -->
+  ${alerts.length > 0 ? `
+  <div class="body-section-title alert-title">
+    ⚠ Fiches anomalies
+    <span class="body-section-count">${alerts.length}</span>
+  </div>
+  ${fichesAlertes}` : ''}
+
+  <!-- Fiches observations -->
+  ${normaux.length > 0 ? `
+  <div class="body-section-title">
+    Observations
+    <span class="body-section-count">${normaux.length}</span>
+  </div>
+  ${fichesNormaux}` : ''}
+
 </div>
+
+<!-- Footer fixe sur chaque page -->
+<div class="report-footer">
+  <div class="footer-left">${rapportRef} · ${escPDF(title)}</div>
+  <div class="footer-center">RATP Group · PK Tracker Pro v7</div>
+  <div class="footer-right">${dateStr} · ${timeStr}</div>
+</div>
+
 </body>
 </html>`;
 }
